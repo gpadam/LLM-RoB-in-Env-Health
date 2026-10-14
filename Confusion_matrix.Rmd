@@ -196,3 +196,264 @@ flextable(results_binary) %>%
   autofit() %>%
   set_caption("Agreement Statistics by Comparison (Partial agreement)")
 ```
+
+
+```{r}
+
+library(dplyr)
+library(purrr)
+
+ordinal_levels <- c("Low Risk", "Probably Low Risk",
+                    "Probably High Risk", "High Risk")
+
+match_stats <- function(cm_table, label, levels = ordinal_levels) {
+
+  # Drop "Not Applicable" (not on the ordinal scale)
+  tab   <- cm_table[levels, levels]
+  total <- sum(tab)
+
+  # Exact match = the diagonal
+  exact <- sum(diag(tab))
+
+  # Partial match = same side of the scale (includes exact matches)
+  side      <- c("Low", "Low", "High", "High")
+  same_side <- outer(side, side, "==")
+  partial   <- sum(tab[same_side])
+
+  ci_exact   <- binom.test(exact,   total)$conf.int
+  ci_partial <- binom.test(partial, total)$conf.int
+
+  tibble::tibble(
+    comparison  = label,
+    n           = total,
+    exact_n     = exact,
+    exact_pct   = exact / total * 100,
+    exact_lci   = ci_exact[1] * 100,
+    exact_uci   = ci_exact[2] * 100,
+    partial_n   = partial,
+    partial_pct = partial / total * 100,
+    partial_lci = ci_partial[1] * 100,
+    partial_uci = ci_partial[2] * 100
+  )
+}
+
+match_results <- bind_rows(
+  match_stats(cm_gpt$table,    "GPT"),
+  match_stats(cm_gemini$table, "Gemini"),
+  match_stats(cm_human1$table, "Human 1"),
+  match_stats(cm_human2$table, "Human 2")
+) %>%
+  mutate(across(where(is.numeric) & !c(n, exact_n, partial_n), ~round(.x, 1)))
+
+match_results
+
+
+```
+
+
+```{r}
+ordinal_levels <- c("Low Risk", "Probably Low Risk",
+                    "Probably High Risk", "High Risk")
+
+match_by_level <- function(cm_table, label, levels = ordinal_levels) {
+
+  # Drop "Not Applicable" (not on the ordinal scale)
+  tab  <- cm_table[levels, levels]
+  side <- c("Low", "Low", "High", "High")
+
+  map_dfr(seq_along(levels), function(j) {
+    total   <- sum(tab[, j])                       # all cases with this consensus level
+    exact   <- tab[j, j]                           # rater matched consensus exactly
+    partial <- sum(tab[side == side[j], j])        # rater on same side (includes exact)
+
+    # binom.test() fails when n = 0, so return NAs for empty levels
+    if (total == 0) {
+      ci_e <- ci_p <- c(NA_real_, NA_real_)
+    } else {
+      ci_e <- binom.test(exact,   total)$conf.int
+      ci_p <- binom.test(partial, total)$conf.int
+    }
+
+    tibble::tibble(
+      rater          = label,
+      human_level    = levels[j],
+      n              = total,
+      exact_n        = exact,
+      exact_pct      = if (total == 0) NA_real_ else exact / total * 100,
+      exact_lci      = ci_e[1] * 100,
+      exact_uci      = ci_e[2] * 100,
+      partial_n      = partial,
+      partial_pct    = if (total == 0) NA_real_ else partial / total * 100,
+      partial_lci    = ci_p[1] * 100,
+      partial_uci    = ci_p[2] * 100
+    )
+  })
+}
+
+match_by_level_results <- bind_rows(
+  match_by_level(cm_gpt$table,    "GPT"),
+  match_by_level(cm_gemini$table, "Gemini")
+) %>%
+  mutate(across(c(exact_pct, exact_lci, exact_uci,
+                  partial_pct, partial_lci, partial_uci),
+                ~round(.x, 1)))
+
+match_by_level_results
+
+
+
+```
+
+
+```{r}
+get_agreement_stats <- function(data, test_col, ref_col = "Human_consensus",
+                                levels = ordinal_levels, n_boot = 2000) {
+  
+  d <- data %>%
+    select(all_of(c(test_col, ref_col))) %>%
+    filter(!is.na(.data[[test_col]]), !is.na(.data[[ref_col]]))
+  
+  ratings <- data.frame(
+    test = as.numeric(factor(d[[test_col]], levels = levels)),
+    ref  = as.numeric(factor(d[[ref_col]],  levels = levels))
+  )
+  
+  pa_res  <- pa.coeff.raw(ratings, weights = "unweighted")$est
+  ac2_res <- gwet.ac1.raw(ratings, weights = "quadratic")$est
+  
+  tab <- table(factor(d[[test_col]], levels = levels),
+               factor(d[[ref_col]],  levels = levels))
+  kappa_res <- kappa2.table(tab, weights = quadratic.weights(1:length(levels)))
+  kappa_ci  <- as.numeric(unlist(strsplit(gsub("[()]", "", kappa_res$coeff.ci), ",")))
+  
+  f1_macro <- function(dat, idx) {
+    dd <- dat[idx, ]
+    cm <- caret::confusionMatrix(
+      factor(dd$test, levels = seq_along(levels)),
+      factor(dd$ref,  levels = seq_along(levels))
+    )
+    if (is.matrix(cm$byClass)) {
+      mean(cm$byClass[, "F1"], na.rm = TRUE)
+    } else {
+      cm$byClass[["F1"]]
+    }
+  }
+  f1_point <- f1_macro(ratings, seq_len(nrow(ratings)))
+  f1_boot  <- boot(ratings, f1_macro, R = n_boot)
+  f1_ci    <- boot.ci(f1_boot, type = "perc")$percent[4:5]
+  
+  tibble::tibble(
+    comparison    = paste(test_col, "vs", ref_col),
+    n             = nrow(d),
+    pct_agree     = pa_res$pa,           pct_agree_lci = pa_res$conf.int[1], pct_agree_uci = pa_res$conf.int[2],
+    ac2           = ac2_res$coeff.val,   ac2_lci       = ac2_res$conf.int[1], ac2_uci      = ac2_res$conf.int[2],
+    kappa_w       = kappa_res$coeff.val, kappa_w_lci   = kappa_ci[1],         kappa_w_uci  = kappa_ci[2],
+    f1_macro      = f1_point,            f1_lci        = f1_ci[1],            f1_uci       = f1_ci[2]
+  )
+}
+
+binary_levels <- c("Low Risk", "High Risk")
+
+# Exact: 4 categories (RoB2 already has "Not Applicable" set to NA)
+human_exact <- get_agreement_stats(RoB2, test_col = "Human__1", ref_col = "Human_2",
+                                   levels = ordinal_levels) %>%
+  mutate(match_type = "Exact (4 categories)", .before = 1)
+
+# Partial: Low/Probably Low combined, Probably High/High combined
+human_partial <- get_agreement_stats(RoB_binary, test_col = "Human__1", ref_col = "Human_2",
+                                     levels = binary_levels) %>%
+  mutate(match_type = "Partial (Low vs High)", .before = 1)
+
+human_results <- bind_rows(human_exact, human_partial) %>%
+  mutate(across(where(is.numeric) & !n, ~round(.x, 3)))
+
+human_results
+
+
+
+```
+
+
+```{r}
+#fix F1
+
+library(dplyr)
+library(purrr)
+library(tibble)
+
+# F1 from a confusion table (rows = rater being evaluated, columns = reference)
+# F1 = 2*TP / (n_predicted + n_true), which is 0 when TP = 0 and undefined only
+# when a class is absent from BOTH raters.
+f1_from_table <- function(tab, classes = c("either", "reference")) {
+  classes <- match.arg(classes)
+  tp     <- diag(tab)
+  pred_n <- rowSums(tab)
+  true_n <- colSums(tab)
+
+  f1   <- ifelse(pred_n + true_n == 0, NA_real_, 2 * tp / (pred_n + true_n))
+  keep <- if (classes == "either") (pred_n + true_n) > 0 else true_n > 0
+
+  list(per_class = f1, macro = mean(f1[keep]))
+}
+
+f1_stats <- function(data, test_col, ref_col = "Human_consensus", levels,
+                     classes = "either", n_boot = 2000, seed = 123) {
+
+  d <- data %>%
+    select(all_of(c(test_col, ref_col))) %>%
+    filter(!is.na(.data[[test_col]]), !is.na(.data[[ref_col]]))
+
+  test <- factor(d[[test_col]], levels = levels)
+  ref  <- factor(d[[ref_col]],  levels = levels)
+
+  point <- f1_from_table(table(test, ref), classes)
+
+  set.seed(seed)
+  boot_macro <- replicate(n_boot, {
+    i <- sample(seq_along(test), replace = TRUE)
+    f1_from_table(table(test[i], ref[i]), classes)$macro
+  })
+  ci <- quantile(boot_macro, c(0.025, 0.975), na.rm = TRUE)
+
+  per_class <- setNames(as.list(point$per_class),
+                        paste0("f1_", gsub(" ", "_", levels)))
+
+  tibble(comparison = paste(test_col, "vs", ref_col),
+         n          = length(test),
+         f1_macro   = point$macro,
+         f1_lci     = ci[[1]],
+         f1_uci     = ci[[2]]) %>%
+    bind_cols(as_tibble(per_class))
+}
+
+
+compare_cols  <- c("gpt_response", "gemini_response", "Human__1", "Human_2")
+binary_levels <- c("Low Risk", "High Risk")
+
+# vs Human consensus: exact (4 categories) and partial (Low vs High)
+f1_consensus_exact <- map_dfr(compare_cols,
+    ~f1_stats(RoB2, .x, levels = ordinal_levels)) %>%
+  mutate(analysis = "Exact (4 categories)", .before = 1)
+
+f1_consensus_partial <- map_dfr(compare_cols,
+    ~f1_stats(RoB_binary, .x, levels = binary_levels)) %>%
+  mutate(analysis = "Partial (Low vs High)", .before = 1)
+
+# Human 1 vs Human 2, both directions since F1 is not symmetric
+f1_human_exact <- bind_rows(
+    f1_stats(RoB2, "Human__1", "Human_2", levels = ordinal_levels),
+    f1_stats(RoB2, "Human_2", "Human__1", levels = ordinal_levels)) %>%
+  mutate(analysis = "Exact (4 categories)", .before = 1)
+
+f1_human_partial <- bind_rows(
+    f1_stats(RoB_binary, "Human__1", "Human_2", levels = binary_levels),
+    f1_stats(RoB_binary, "Human_2", "Human__1", levels = binary_levels)) %>%
+  mutate(analysis = "Partial (Low vs High)", .before = 1)
+
+f1_results <- bind_rows(f1_consensus_exact, f1_consensus_partial,
+                        f1_human_exact, f1_human_partial) %>%
+  mutate(across(where(is.numeric) & !n, ~round(.x, 3)))
+
+f1_results
+
+```
